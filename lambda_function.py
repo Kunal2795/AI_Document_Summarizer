@@ -1,77 +1,98 @@
 import json
 import boto3
 import os
-import time
-import random
+import io
 from urllib.parse import unquote_plus
-import botocore.exceptions
+
+# External modules
+from pdfminer.high_level import extract_text  # replacing fitz
+import docx  # python-docx
 
 s3 = boto3.client('s3')
 bedrock = boto3.client('bedrock-runtime', region_name='us-east-1')
 
-MAX_RETRIES = 5
 
-def invoke_bedrock_model(payload):
-    for attempt in range(MAX_RETRIES):
-        try:
-            return bedrock.invoke_model(
-                modelId='anthropic.claude-3-sonnet-20240229-v1:0',
-                contentType='application/json',
-                accept='application/json',
-                body=json.dumps(payload)
-            )
-        except botocore.exceptions.ClientError as e:
-            if e.response['Error']['Code'] == 'ThrottlingException':
-                wait = (2 ** attempt) + random.uniform(0, 1)
-                print(f"Throttled. Retry {attempt + 1}, waiting {wait:.2f}s...")
-                time.sleep(wait)
-            else:
-                raise
-    raise Exception("Exceeded max retry attempts due to throttling.")
+def extract_text_from_pdf(file_stream):
+    temp_pdf_path = "/tmp/temp_input.pdf"
+    with open(temp_pdf_path, "wb") as f:
+        f.write(file_stream.read())
+    return extract_text(temp_pdf_path)
+
+
+def extract_text_from_docx(file_stream):
+    document = docx.Document(file_stream)
+    return '\n'.join([para.text for para in document.paragraphs])
+
 
 def lambda_handler(event, context):
-    bucket = event['Records'][0]['s3']['bucket']['name']
-    key = unquote_plus(event['Records'][0]['s3']['object']['key'])
+    try:
+        # Parse S3 event
+        bucket = event['Records'][0]['s3']['bucket']['name']
+        key = unquote_plus(event['Records'][0]['s3']['object']['key'])
 
-    if not key.endswith(".txt") or not key.startswith("uploads/"):
-        print(f"Ignored file: {key}")
-        return
+        # Validate source folder
+        if not key.startswith("uploads/"):
+            print(f"Skipped key not in uploads/: {key}")
+            return {"statusCode": 400, "body": "File not in uploads/ folder"}
 
-    # Prevent reprocessing summary files
-    if "_summary" in os.path.basename(key):
-        print("Skipping already summarized file.")
-        return
+        print(f"Received file: s3://{bucket}/{key}")
+        file_ext = key.lower().split('.')[-1]
 
-    # Read file content
-    response = s3.get_object(Bucket=bucket, Key=key)
-    document_text = response['Body'].read().decode('utf-8')[:10000]
+        # Get file object
+        s3_object = s3.get_object(Bucket=bucket, Key=key)
+        file_stream = io.BytesIO(s3_object['Body'].read())
 
-    # Prompt for Claude
-    messages = [
-        {
-            "role": "user",
-            "content": f"Summarize the following document:\n\n{document_text}"
+        # Extract text based on file type
+        if file_ext == "txt":
+            document_text = file_stream.read().decode("utf-8")
+        elif file_ext == "pdf":
+            document_text = extract_text_from_pdf(file_stream)
+        elif file_ext in ["docx", "doc"]:
+            document_text = extract_text_from_docx(file_stream)
+        else:
+            print(f"Unsupported file type: {key}")
+            return {"statusCode": 400, "body": "Unsupported file type"}
+
+        print(f"Document length: {len(document_text)} characters")
+
+        # Claude 3 Messages API format
+        messages = [
+            {
+                "role": "user",
+                "content": f"Summarize the following document:\n\n{document_text}"
+            }
+        ]
+
+        # Call Claude 3 via Bedrock (Messages API)
+        bedrock_response = bedrock.invoke_model(
+            modelId="anthropic.claude-3-sonnet-20240229-v1:0",
+            contentType="application/json",
+            accept="application/json",
+            body=json.dumps({
+                "anthropic_version": "bedrock-2023-05-31",
+                "messages": messages,
+                "max_tokens": 500
+            })
+        )
+
+        result = json.loads(bedrock_response['body'].read())
+        summary = result['content'][0]['text']
+        print("Summary received from Claude.")
+
+        # Save to S3
+        filename = os.path.basename(key).rsplit('.', 1)[0] + "_summary.txt"
+        summary_key = f"summaries/{filename}"
+        s3.put_object(Bucket=bucket, Key=summary_key, Body=summary.encode("utf-8"))
+        print(f"Summary saved to: s3://{bucket}/{summary_key}")
+
+        return {
+            "statusCode": 200,
+            "body": f"Summary saved at s3://{bucket}/{summary_key}"
         }
-    ]
 
-    payload = {
-        "messages": messages,
-        "max_tokens": 500,
-        "anthropic_version": "bedrock-2023-05-31"
-    }
-
-    # Bedrock call with retries
-    bedrock_response = invoke_bedrock_model(payload)
-    result = json.loads(bedrock_response['body'].read())
-    summary = result['content'][0]['text']
-
-    # Prepare output path
-    base_name = os.path.basename(key).replace(".txt", "")
-    summary_key = f"summaries/{base_name}_summary.txt"
-
-    s3.put_object(Bucket=bucket, Key=summary_key, Body=summary.encode("utf-8"))
-
-    return {
-        "statusCode": 200,
-        "body": f"Summary saved at {summary_key}"
-    }
+    except Exception as e:
+        print(f"Error: {str(e)}")
+        return {
+            "statusCode": 500,
+            "body": f"Error: {str(e)}"
+        }
